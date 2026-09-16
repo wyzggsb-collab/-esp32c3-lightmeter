@@ -1,0 +1,19 @@
+# 编译产物
+build/
+build_*/
+*.bin
+*.elf
+*.map
+
+# Arduino / 编辑器
+.arduinoIDE/
+*.hex
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 临时 / 备份
+*.tmp
+*.log
