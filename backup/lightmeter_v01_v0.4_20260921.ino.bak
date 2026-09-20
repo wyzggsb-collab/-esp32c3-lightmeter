@@ -1,5 +1,5 @@
 /*
- * lightmeter_v01.ino  — 摄影测光表 v0.6
+ * lightmeter_v01.ino  — 摄影测光表 v0.4
  * ==================================================================
  * Hardware : ESP32-C3 SuperMini
  *   OLED   : 1.3" SSD1106/SH1106 128x64, I2C 0x3C  (SDA=4 SCL=5), 400kHz
@@ -10,17 +10,9 @@
  *   长按 PUSH (开机前)  -> 开机进入主界面
  *   长按 PUSH (开机后)  -> 进入模式选择页 (P/A/AV/TV/M/OFF)
  *   模式页: 旋转选择, 按压确认; OFF = 关机
- *   *** A 档确认 -> 进入二级场景页 (Auto/Night/Slow/Land/Street) ***
- *       场景页: 旋转选择, 按压确认; 长按 = 退回模式页
  *   主界面短按          -> 切字段 SHUTTER/APERT/ISO/FILTER (档位允许时)
  *   旋转                -> 改当前字段
  *   30 秒无操作         -> 息屏; 旋转/按键唤醒
- *
- * v0.6 新增 (A 档二级场景页):
- *   场景只决定「放开哪些字段 + 求解策略 + 边界 + 特殊修正」;
- *   ISO 保持全局字段, 进场景后仍可用旋钮调 (数码/胶片通用).
- *   场景名英文 (6x12 字体不支持中文).
- *   互易律补偿 (慢门/长曝): 手动系数开关 (RECIP: OFF/+1/3/+1/2/+1)
  *
  * 档位:
  *   P  程序优先: 用户动过的项固定(高亮), 其余由程序用安全值算
@@ -111,99 +103,21 @@ static const Filter kFilters[] = {
 };
 static const int kNFilters = sizeof(kFilters) / sizeof(kFilters[0]);
 
-// 安全边界索引 (全局默认)
+// 安全边界索引
 #define SAFE_SHUTTER_IDX 13    // 1/250 (不能更快 = 索引不能超过它)
 #define SAFE_ISO_IDX     7     // 6400  (不能更高)
 #define SAFE_APERT_IDX   18    // f/8.0 (不能更大光圈 = 索引不能低于它)
-
-// 快门数组索引速查 (kShutters 顺序: 30,15,8,4,2,1, 1/2,1/4,1/8,1/15,1/30,1/60,
-//   1/125,1/250,1/500,1/1000,1/2000,1/4000,1/8000)
-// idx:  0=30s  1=15s 2=8s 3=4s 4=2s 5=1s 6=1/2 7=1/4 8=1/8 9=1/15
-//      10=1/30 11=1/60 12=1/125 13=1/250 14=1/500 15=1/1000 ... 18=1/8000
-#define SH_IDX_1S   5
-#define SH_IDX_1_2  6
-#define SH_IDX_1_4  7
-#define SH_IDX_1_8  8
-#define SH_IDX_1_15 9
-#define SH_IDX_1_30 10
-#define SH_IDX_1_60 11
-#define SH_IDX_1_500 14
 
 // ---------- modes ----------
 enum Mode { MODE_P = 0, MODE_A, MODE_AV, MODE_TV, MODE_M, MODE_OFF, MODE_COUNT };
 static const char *kModeNames[] = { "P", "A", "AV", "TV", "M", "OFF" };
 
 static Mode mode = MODE_M;
-static bool selectingMode = false;    // 是否在模式选择页 (一级)
+static bool selectingMode = false;    // 是否在模式选择页
 static int  selIdx = 0;               // 选择页光标
-
-// ---------- scenes (A 档二级页) ----------  <<< moved below Field enum
 
 // ---------- fields ----------
 enum Field { F_SHUTTER = 0, F_APERTURE, F_ISO, F_FILTER, F_COUNT };
-
-// ---------- scenes (A 档二级页) ----------
-// 场景只决定放开哪些字段 / 求解策略 / 边界 / 特殊修正; ISO 全局可调.
-enum SolveKind { SOLVE_FULL = 0, SOLVE_NIGHT, SOLVE_SLOW, SOLVE_LAND, SOLVE_STREET, SOLVE_PORTRAIT };
-
-#define EF_SHUTTER  (1 << F_SHUTTER)
-#define EF_APERTURE (1 << F_APERTURE)
-#define EF_ISO      (1 << F_ISO)
-#define EF_FILTER   (1 << F_FILTER)
-
-struct Scene {
-  const char *name;        // 6x12: 显示名 (短)
-  const char *desc;        // 描述
-  int   editableMask;      // 允许旋钮调的字段 (bit: 1<<Field)
-  int   solveKind;         // 求解策略
-  int   shMinIdx;          // 快门索引下限
-  int   shMaxIdx;          // 快门索引上限
-  int   apMinIdx;          // 光圈索引下限 (大光圈 = 小索引)
-  int   apMaxIdx;
-  int   isoMaxIdx;         // ISO 上限
-  bool  reciprocity;       // 是否启用互易律补偿
-  bool  flashHint;         // 是否提示闪光
-  int   recGuide;          // 慢门推荐快门索引
-};
-
-static const Scene kScenes[] = {
-  // name        desc              editable                        kind         shMin shMax apMin apMax isoMax recip flash recGuide
-  { "Auto",      "Full Auto",     0,                              SOLVE_FULL,   0,  13,   0,  27,   7,   false, false, 0 },
-  { "Night",     "Slow+Flash",    EF_APERTURE | EF_ISO | EF_FILTER, SOLVE_NIGHT,  7,  13,   0,  27,   7,   false, true,  7 },
-  { "Slow",      "Long Exp",      EF_SHUTTER | EF_APERTURE | EF_ISO | EF_FILTER, SOLVE_SLOW, 0, 13, 0, 27, 7, true, false, 5 },
-  { "Land",      "Small Apert",   EF_APERTURE | EF_ISO | EF_FILTER, SOLVE_LAND,  0,  13,   9,  27,   7,   false, false, 0 },
-  { "Street",    "Fast Shutter",  EF_APERTURE | EF_ISO | EF_FILTER, SOLVE_STREET, 0, 13,  0,  27,   7,   false, false, 0 },
-  { "Portrait",  "Big Aperture",  EF_APERTURE | EF_ISO | EF_FILTER, SOLVE_PORTRAIT, 0, 13, 0, 27, 7, false, false, 0 },
-};
-static const int kNScenes = sizeof(kScenes) / sizeof(kScenes[0]);
-
-// 闪光灯 GN 表 (ISO100, 米). 用户按住 PUSH 在 Night 场景里旋转切换.
-// 内置闪 / 小机顶闪 ~12, 中端机顶闪 ~32-43, 大功率外闪 ~58-60
-static const char *kGnNames[] = { "OFF", "4", "8", "12", "22", "32", "43", "58" };
-static const float kGnVals[]  = { 0.0f, 4.0f, 8.0f, 12.0f, 22.0f, 32.0f, 43.0f, 58.0f };
-static const int   kNGn = 8;
-static int gnIdx = 5;                 // 默认 GN32
-static float subjectDist = 3.0f;      // 拍摄距离 (米), 按住 PUSH 短按切换
-static const float kDistVals[] = { 1.0f, 1.5f, 2.0f, 3.0f, 5.0f, 8.0f };
-static const int   kNDist = 6;
-static int distIdx = 3;               // 默认 3m
-
-
-static const char *kRecipNames[] = { "OFF", "+1/3", "+1/2", "+1" };
-static const float kRecipStops[] = { 0.0f, 1.0f / 3.0f, 0.5f, 1.0f };
-static const int kNFRecip = 4;
-static int  recipIdx = 0;
-
-static bool inSceneSelect = false;
-static int  sceneIdx = 0;
-static int  sceneCursor = 0;
-
-// 列表页重绘标志 (不在编码器/按键路径里直接刷屏)
-static bool needListRender = false;
-static unsigned long lastListMs = 0;
-
-// 顺时针旋转 = 下一项 (已与硬件约定一致; 若实际相反把 step 取反即可)
-#define ENC_CW_NEXT 1
 
 static bool powerOn = false;
 static int  field = F_SHUTTER;
@@ -214,17 +128,8 @@ static int  filterIdx   = 0;     // NONE
 static float lux        = 100.0f;
 static bool  needRedraw = false;
 
-// 闪光曝光: 全功率闪光下的推荐光圈 N = GN / d (含 ISO 修正)
-static float flashAperture() {
-  if (gnIdx == 0 || subjectDist <= 0) return 0;
-  float isoFactor = sqrtf(kIsos[isoIdx] / 100.0f);
-  float gnEff = kGnVals[gnIdx] * isoFactor;
-  return gnEff / subjectDist;
-}
-
 // 用户手动动过的项 (P 档用; 高亮表示)
 static bool userSet[F_COUNT] = { false, false, false, false };
-static bool userIsoLocked = false;   // A 档: 用户手动改过 ISO, 求解时不覆盖
 
 // 无解闪烁
 static bool  noSolution = false;
@@ -355,22 +260,11 @@ static int nearestISO(float iso) {
   return best;
 }
 
-// 检查是否越界 (按当前档位/场景的边界)
+// 检查是否越界
 static bool outOfRange() {
-  int shMax = SAFE_SHUTTER_IDX;
-  int isoMax = SAFE_ISO_IDX;
-  int apMin  = SAFE_APERT_IDX;
-
-  if (mode == MODE_A) {
-    const Scene &sc = kScenes[sceneIdx];
-    shMax = sc.shMaxIdx;
-    isoMax = sc.isoMaxIdx;
-    apMin  = sc.apMinIdx;
-  }
-
-  if (shutterIdx < 0 || shutterIdx > shMax) return true;  // 比限制更快
-  if (isoIdx > isoMax) return true;                       // ISO 超限
-  if (apertureIdx < apMin) return true;                   // 光圈太大
+  if (shutterIdx < 0 || shutterIdx > SAFE_SHUTTER_IDX) return true;  // 比 1/250 更快
+  if (isoIdx > SAFE_ISO_IDX) return true;                            // ISO > 6400
+  if (apertureIdx < SAFE_APERT_IDX) return true;                     // 光圈 > f/8
   return false;
 }
 
@@ -384,8 +278,6 @@ static bool outOfRange() {
 //   TV: 固定快门 -> 先试 ISO=当前值, 求光圈; 光圈越界则调 ISO
 //   P : 固定用户动过的项, 其余用安全值求解
 static void solveAuto() {
-  // A 档不走此路径 (由 solveAutoFull 处理)
-  if (mode == MODE_A) return;
   // EV100 部分 (不含 ISO)
   float ev100 = (lux <= 0) ? 0 : log2f(lux / 2.5f) + kFilters[filterIdx].ev;
 
@@ -460,113 +352,12 @@ static void solveAuto() {
   noSolution = outOfRange();
 }
 
-// A 档: 全自动, 一次算出最佳 (按场景求解策略)
-// 场景只改变「锁定什么 / 优先顺序」, ISO 仍可旋钮调但会被优化策略选用
-static void clampScene() {
-  const Scene &sc = kScenes[sceneIdx];
-  if (shutterIdx < sc.shMinIdx) shutterIdx = sc.shMinIdx;
-  if (shutterIdx > sc.shMaxIdx) shutterIdx = sc.shMaxIdx;
-  if (apertureIdx < sc.apMinIdx) apertureIdx = sc.apMinIdx;
-  if (apertureIdx > sc.apMaxIdx) apertureIdx = sc.apMaxIdx;
-  if (isoIdx > sc.isoMaxIdx) isoIdx = sc.isoMaxIdx;
-}
-
-static void solveAutoFullInner() {
+// A 档: 全自动, 一次算出最佳
+static void solveAutoFull() {
   float ev100 = (lux <= 0) ? 0 : log2f(lux / 2.5f) + kFilters[filterIdx].ev;
-  const Scene &sc = kScenes[sceneIdx];
-  int kind = (mode == MODE_A) ? sc.solveKind : SOLVE_FULL;
-
-  // 互易律补偿: 慢门场景时, 实际需要的曝光量下调 => 光阀可以更快
-  float recip = (mode == MODE_A && sc.reciprocity) ? kRecipStops[recipIdx] : 0.0f;
-  float evEff = ev100 - recip;
-
-  if (kind == SOLVE_NIGHT) {
-    // 夜景人像: 闪光凝固主体 (光圈由 GN/距离 定), 背景靠慢门吃环境光
-    if (gnIdx > 0) {
-      float nFlash = flashAperture();
-      if (nFlash > 0) {
-        apertureIdx = nearestAperture(nFlash);
-      }
-    }
-    // 快门: 在慢门区间内选能对齐背景曝光的挡位
-    float ev = evEff + log2f(kIsos[isoIdx] / 100.0f);
-    float t = (kApertures[apertureIdx] * kApertures[apertureIdx]) / powf(2.0f, ev);
-    int ti = nearestShutter(t);
-    if (ti < SH_IDX_1_4) ti = SH_IDX_1_4;       // 慢于 1/4 则锁 1/4
-    if (ti > SH_IDX_1_15) ti = SH_IDX_1_15;     // 快于 1/15 则锁 1/15
-    shutterIdx = ti;
-    noSolution = false;
-    return;
-  }
-
-  if (kind == SOLVE_SLOW) {
-    // 慢门: 快门固定为用户所选, 光圈/ISO 由程序配 (先光圈后 ISO)
-    float ev = evEff + log2f(kIsos[isoIdx] / 100.0f);
-    float apMax = 11.0f;   // 默认不低于 f/11 (慢门画质)
-    float N = sqrtf(kShutters[shutterIdx] * powf(2.0f, ev));
-    if (N < apMax) N = apMax;
-    apertureIdx = nearestAperture(N);
-    if (apertureIdx > sc.apMaxIdx) apertureIdx = sc.apMaxIdx;
-    noSolution = outOfRange();
-    return;
-  }
-
-  if (kind == SOLVE_LAND) {
-    // 风光: 小光圈优先 (随光量从 f/16 到 f/8), ISO 尽量低, 快门自由
-    float ev = evEff;
-    for (int s = 0; s < kNIsos; s++) {
-      float e = ev + log2f(kIsos[s] / 100.0f);
-      for (int a = 24; a >= 9; a--) {          // f/16 -> f/4.5
-        float t = (kApertures[a] * kApertures[a]) / powf(2.0f, e);
-        int ti = nearestShutter(t);
-        if (ti >= 0 && ti <= SH_IDX_1_500) {   // 手抖窗内
-          isoIdx = s; apertureIdx = a; shutterIdx = ti;
-          noSolution = false;
-          return;
-        }
-      }
-    }
-    noSolution = true;
-    return;
-  }
-
-  if (kind == SOLVE_STREET) {
-    // 抓拍: 快门保底 1/500, 优先大光圈, ISO 兜底
-    for (int s = 0; s < kNIsos; s++) {
-      float e = evEff + log2f(kIsos[s] / 100.0f);
-      float N = sqrtf(kShutters[SH_IDX_1_500] * powf(2.0f, e));
-      int ap = nearestAperture(N);
-      if (ap >= 0) {
-        isoIdx = s; apertureIdx = ap; shutterIdx = SH_IDX_1_500;
-        noSolution = outOfRange();
-        return;
-      }
-    }
-    noSolution = true;
-    return;
-  }
-
-  if (kind == SOLVE_PORTRAIT) {
-    // 人像: 大光圈优先 (景深浅), 快门保安全, ISO 兜底
-    for (int a = 2; a < kNApertures; a++) {          // f/1.2 起往回找
-      for (int s = 0; s < kNIsos; s++) {
-        float e = evEff + log2f(kIsos[s] / 100.0f);
-        float t = (kApertures[a] * kApertures[a]) / powf(2.0f, e);
-        int ti = nearestShutter(t);
-        if (ti >= SH_IDX_1_15 && ti <= SH_IDX_1_500) {   // 安全快门区间
-          apertureIdx = a; isoIdx = s; shutterIdx = ti;
-          noSolution = false;
-          return;
-        }
-      }
-    }
-    noSolution = true;
-    return;
-  }
-
-  // SOLVE_FULL (Auto): 安全快门 1/250 + 优先低 ISO
+  // 安全快门 1/250 + 优先低 ISO
   for (int i = 0; i < kNIsos; i++) {          // ISO 从低到高
-    float ev = evEff + log2f(kIsos[i] / 100.0f);
+    float ev = ev100 + log2f(kIsos[i] / 100.0f);
     float N = sqrtf(kShutters[SAFE_SHUTTER_IDX] * powf(2.0f, ev));
     int ap = nearestAperture(N);
     if (ap >= SAFE_APERT_IDX && ap < kNApertures) {
@@ -578,31 +369,15 @@ static void solveAutoFullInner() {
   noSolution = true;                          // 全试完都不行
 }
 
-// 包装: A 档下若用户手动锁了 ISO, 求解结果不覆盖它
-static void solveAutoFull() {
-  if (mode == MODE_A && userIsoLocked) {
-    float savedE = 0;
-    int savedIso = isoIdx;
-    (void)savedE;
-    solveAutoFullInner();
-    isoIdx = savedIso;
-  } else {
-    solveAutoFullInner();
-  }
-}
-
 // ---------- UI helpers ----------
 static bool fieldEditable(int f) {
   if (f == F_FILTER) return true;             // 滤镜所有档位可调
   switch (mode) {
     case MODE_M:  return true;
     case MODE_P:  return true;                // P: 任意项可动
-    case MODE_A: {                            // A: 按场景放开字段
-      const Scene &sc = kScenes[sceneIdx];
-      return (sc.editableMask & (1 << f)) != 0;
-    }
     case MODE_AV: return (f == F_APERTURE);
     case MODE_TV: return (f == F_SHUTTER);
+    case MODE_A:  return false;               // A: 只能调滤镜
     default:      return false;
   }
 }
@@ -611,7 +386,6 @@ static bool fieldEditable(int f) {
 static bool fieldHighlight(int f) {
   if (mode == MODE_P) return userSet[f];
   if (mode == MODE_M) return (f == field);
-  if (mode == MODE_A)  return (f == field);   // A: 当前编辑项高亮
   if (f == F_FILTER)  return (f == field);    // 滤镜当前编辑时高亮
   return (f == field);
 }
@@ -632,15 +406,10 @@ static void renderContent() {
 
   const char *labels[4] = { "SHUTTER", "APERT", "ISO", "FILTER" };
   char vals[4][12];
-
-  bool gfMode = (mode == MODE_A && kScenes[sceneIdx].flashHint && gnIdx > 0);
-  if (gfMode) labels[3] = "FLASH";
-
   fmtShutter(vals[0], 12, kShutters[shutterIdx]);
   snprintf(vals[1], 12, "f/%.1f", kApertures[apertureIdx]);
   snprintf(vals[2], 12, "%d", (int)kIsos[isoIdx]);
-  if (gfMode) snprintf(vals[3], 12, "GN%d", (int)kGnVals[gnIdx]);
-  else        snprintf(vals[3], 12, "%s", kFilters[filterIdx].name);
+  snprintf(vals[3], 12, "%s", kFilters[filterIdx].name);
 
   int ys[4] = { 24, 37, 50, 63 };
 
@@ -658,12 +427,7 @@ static void renderContent() {
 
   // 偏差 (电池后, 文字基线 y=10)
   if (showDelta) u8g2.drawStr(26, 10, dbuf);
-  // lux (A 档时位置让给场景名, lux 只显示整数部分也塞得下)
-  if (mode == MODE_A) {
-    snprintf(lb, sizeof(lb), "%s", kScenes[sceneIdx].name);
-  } else {
-    snprintf(lb, sizeof(lb), "%.0f lx", lux);
-  }
+  snprintf(lb, sizeof(lb), "%.0f lx", lux);
   u8g2.drawStr(58, 10, lb);
   u8g2.drawVLine(56, 0, 11);      // 竖线1: 偏差 | lux
   // 模式字母右对齐到右边缘 (128)
@@ -681,216 +445,39 @@ static void renderContent() {
     if (hl) u8g2.drawBox(2, ys[r] - 10, 126, 12);
     u8g2.setDrawColor(hl ? 0 : 1);
     u8g2.setFont(u8g2_font_6x12_tf);
-    if (gfMode) u8g2.setFont(u8g2_font_5x8_tf);   // 闪光线小一号, 塞下 N/d
     u8g2.drawStr(4, ys[r], labels[r]);
     u8g2.drawStr(72, ys[r], vals[r]);
-    if (gfMode && r == 3) {
-      u8g2.drawStr(96, ys[r], "N/d");
-    }
     u8g2.setDrawColor(1);
-  }
-
-  // 闪光推荐光圈 (按 GN / 距离), 画在 iso 挡位行右侧空白处
-  if (gfMode) {
-    float nf = flashAperture();
-    char fb[12];
-    snprintf(fb, sizeof(fb), "f%.1f", nf);
-    u8g2.setFont(u8g2_font_6x12_tf);
-    u8g2.drawStr(96, ys[2], fb);
   }
   u8g2.sendBuffer();
 }
 
 // 模式选择页
-// 模式页: 方块网格 (6 项 = 3x2, 相邻共边) + 底部描述
 static void renderModeSelect() {
   u8g2.clearBuffer();
-
-  const int cols = 3, rows = 2;
-  const int tw = 40, th = 22;      // 方块尺寸 (相邻无间隙 = 共边)
-  const int x0 = 4, y0 = 2;        // 起点
-
-  static const char *shortNames[] = { "P", "A", "AV", "TV", "M", "OFF" };
-
-  for (int i = 0; i < MODE_COUNT; i++) {
-    int cx = i % cols;
-    int cy = i / cols;
-    int x = x0 + cx * tw;
-    int y = y0 + cy * th;
-    bool sel = (i == selIdx);
-
-    if (sel) {
-      u8g2.drawBox(x, y, tw, th);
-      u8g2.setDrawColor(0);
-    }
-    u8g2.drawFrame(x, y, tw, th);   // 共边: 相邻方块边框重合
-    u8g2.setDrawColor(1);
-    if (sel) u8g2.setDrawColor(0);
-
-    const char *nm = shortNames[i];
-    // 字体自适应: 宽度不超过方块内宽, 不溢出边框
-    const uint8_t *font = u8g2_font_7x13B_tf;
-    int w = 0;
-    int inner = tw - 6;
-    const uint8_t *cands[3] = { u8g2_font_7x13B_tf, u8g2_font_6x12_tf, u8g2_font_5x8_tf };
-    for (int k = 0; k < 3; k++) {
-      u8g2.setFont(cands[k]);
-      w = u8g2.getStrWidth(nm);
-      if (w <= inner || k == 2) { font = cands[k]; break; }
-    }
-    u8g2.setFont(font);
-    w = u8g2.getStrWidth(nm);
-    int h = (font == u8g2_font_5x8_tf) ? 8 : ((font == u8g2_font_6x12_tf) ? 12 : 13);
-    u8g2.drawStr(x + (tw - w) / 2, y + (th + h) / 2 - 2, nm);
-    u8g2.setDrawColor(1);
-  }
-
-  // 底部: 选中项描述
-  const char *desc = "";
-  switch (selIdx) {
-    case MODE_P:  desc = "Program AE"; break;
-    case MODE_A:  desc = "Auto (Scene)"; break;
-    case MODE_AV: desc = "Aperture Pri"; break;
-    case MODE_TV: desc = "Shutter Pri"; break;
-    case MODE_M:  desc = "Manual"; break;
-    case MODE_OFF:desc = "Power Off"; break;
-  }
   u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawBox(0, 52, 128, 12);
-  u8g2.setDrawColor(0);
-  int dw = u8g2.getStrWidth(desc);
-  u8g2.drawStr((128 - dw) / 2, 61, desc);
-  u8g2.setDrawColor(1);
-
-  u8g2.sendBuffer();
-}
-
-// 二级场景选择页: 方块网格 (5 项 = 3x2, 第 6 格空) + 底部描述
-static void renderSceneSelect() {
-  u8g2.clearBuffer();
-
-  const int cols = 3;
-  const int tw = 40, th = 22;
-  const int x0 = 4, y0 = 2;
-
-  for (int i = 0; i < kNScenes; i++) {
-    int cx = i % cols;
-    int cy = i / cols;
-    int x = x0 + cx * tw;
-    int y = y0 + cy * th;
-    bool sel = (i == sceneCursor);
-
-    if (sel) {
-      u8g2.drawBox(x, y, tw, th);
-      u8g2.setDrawColor(0);
-    }
-    u8g2.drawFrame(x, y, tw, th);
-    u8g2.setDrawColor(1);
-    if (sel) u8g2.setDrawColor(0);
-
-    const char *nm = kScenes[i].name;
-    // 字体自适应: 保证宽度 <= 方块内宽 (tw-6), 不溢出边框
-    const uint8_t *font = u8g2_font_7x13B_tf;
-    int w = 0;
-    int inner = tw - 6;
-    // 由大到小尝试
-    const uint8_t *cands[3] = { u8g2_font_7x13B_tf, u8g2_font_6x12_tf, u8g2_font_5x8_tf };
-    for (int k = 0; k < 3; k++) {
-      u8g2.setFont(cands[k]);
-      w = u8g2.getStrWidth(nm);
-      if (w <= inner || k == 2) { font = cands[k]; break; }
-    }
-    u8g2.setFont(font);
-    w = u8g2.getStrWidth(nm);
-    int h = (font == u8g2_font_5x8_tf) ? 8 : ((font == u8g2_font_6x12_tf) ? 12 : 13);
-    u8g2.drawStr(x + (tw - w) / 2, y + (th + h) / 2 - 2, nm);
-    u8g2.setDrawColor(1);
-  }
-
-  // 底部描述条
-  const char *desc = kScenes[sceneCursor].desc;
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawBox(0, 52, 128, 12);
-  u8g2.setDrawColor(0);
-  int dw = u8g2.getStrWidth(desc);
-  u8g2.drawStr((128 - dw) / 2, 61, desc);
-  // 慢门场景: 描述条右侧显示互易补偿挡位
-  if (kScenes[sceneCursor].reciprocity) {
-    char rb[8];
-    snprintf(rb, sizeof(rb), "R%s", kRecipNames[recipIdx]);
-    u8g2.drawStr(100, 61, rb);
-  }
-  u8g2.setDrawColor(1);
-
-  u8g2.sendBuffer();
-}
-
-static void enterSceneSelect() {
-  inSceneSelect = true;
-  sceneCursor = sceneIdx;
-  needListRender = true;
-}
-
-// ---------- 距离选择页 (Night 场景专用) ----------
-static bool inDistSelect = false;
-static int  distCursor = 0;
-
-static void renderDistSelect() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr(2, 10, "-- FOCUS DIST --");
+  u8g2.drawStr(2, 10, "-- SELECT --");
   u8g2.drawHLine(2, 12, 126);
 
-  // 大字显示当前距离, 精度 0.1m
-  char b[16];
-  snprintf(b, sizeof(b), "%.1f", subjectDist);
-  u8g2.setFont(u8g2_font_logisoso16_tf);   // 16px 高数字
-  int w = u8g2.getStrWidth(b);
-  u8g2.drawStr((128 - w) / 2 - 8, 44, b);
-  u8g2.setFont(u8g2_font_6x12_tf);
-  u8g2.drawStr((128 - w) / 2 + w - 6, 44, "m");
-
-  // 底行: 范围提示 + 推荐光圈
-  float nf = flashAperture();
-  if (nf > 0) {
-    char fb[16];
-    snprintf(fb, sizeof(fb), "f/%.1f", nf);
-    u8g2.drawStr(2, 63, fb);
+  for (int i = 0; i < MODE_COUNT; i++) {
+    int y = 22 + i * 8;
+    bool sel = (i == selIdx);
+    if (sel) u8g2.drawBox(2, y - 7, 126, 8);
+    u8g2.setDrawColor(sel ? 0 : 1);
+    u8g2.drawStr(6, y, kModeNames[i]);
+    const char *desc = "";
+    switch (i) {
+      case MODE_P:  desc = "Program AE"; break;
+      case MODE_A:  desc = "Auto"; break;
+      case MODE_AV: desc = "Aperture Pri"; break;
+      case MODE_TV: desc = "Shutter Pri"; break;
+      case MODE_M:  desc = "Manual"; break;
+      case MODE_OFF:desc = "Power Off"; break;
+    }
+    u8g2.drawStr(30, y, desc);
+    u8g2.setDrawColor(1);
   }
-  u8g2.drawStr(70, 63, "0.1-30m");
   u8g2.sendBuffer();
-}
-
-static void enterDistSelect() {
-  inDistSelect = true;
-  needListRender = true;
-}
-
-static void applyDist() {
-  inDistSelect = false;
-  solveAutoFull();
-  needRedraw = true;
-}
-
-static void renderListPage() {
-  if (selectingMode) renderModeSelect();
-  else if (inSceneSelect) renderSceneSelect();
-  else if (inDistSelect) renderDistSelect();
-}
-
-static void applyScene() {
-  sceneIdx = sceneCursor;
-  inSceneSelect = false;
-  userIsoLocked = false;      // 换场景 -> 重置 ISO 锁定
-  clampScene();
-  // 高亮跳回第一个可改字段 (Auto 场景 = FILTER), 避免旋钮误改不可改项
-  field = F_SHUTTER;
-  for (int i = 0; i < F_COUNT; i++) {
-    int f = (F_SHUTTER + i) % F_COUNT;
-    if (fieldEditable(f)) { field = f; break; }
-  }
-  if (mode == MODE_A) solveAutoFull();
-  needRedraw = true;
 }
 
 static void screenOff() { cmd(0xAE); }
@@ -909,7 +496,7 @@ static bool screenAsleep = false;
 static void enterModeSelect() {
   selectingMode = true;
   selIdx = 0;
-  needListRender = true;
+  renderModeSelect();
 }
 
 static void pollButton() {
@@ -929,12 +516,7 @@ static void pollButton() {
       if (swDown) {
         swDown = false;
         if (!longFired && !screenAsleep) {
-          if (inDistSelect) {
-            applyDist();
-          } else if (inSceneSelect) {
-            // 二级场景页: 确认
-            applyScene();
-          } else if (selectingMode) {
+          if (selectingMode) {
             // 模式页: 确认
             if (selIdx == MODE_OFF) {
               powerOn = false; selectingMode = false;
@@ -942,23 +524,14 @@ static void pollButton() {
             } else {
               mode = (Mode)selIdx;
               selectingMode = false;
-              userIsoLocked = false;
               for (int i = 0; i < F_COUNT; i++) userSet[i] = false;
-              if (mode == MODE_A) {
-                enterSceneSelect();          // A 档 -> 二级场景页
-              } else if (mode == MODE_P || mode == MODE_AV || mode == MODE_TV) {
-                solveAuto();
-              }
+              if (mode == MODE_A) solveAutoFull();
+              else if (mode == MODE_P || mode == MODE_AV || mode == MODE_TV) solveAuto();
               needRedraw = true;
             }
-            } else if (powerOn) {
-            if (mode == MODE_A) {
-              // A 档短按 = 切字段 (含 FILTER); 高亮到可改项才能用旋钮调
-              int guard = 0;
-              do {
-                field = (field + 1) % F_COUNT;
-                guard++;
-              } while (!fieldEditable(field) && guard < F_COUNT * 2);
+          } else if (powerOn) {
+            if (mode == MODE_A) {           // A 档: 短按 = 测光
+              solveAutoFull();
               requestDraw();
             } else {                        // 其他: 切字段
               int guard = 0;
@@ -979,91 +552,44 @@ static void pollButton() {
     longFired = true;
     if (!powerOn) {
       powerOn = true; screenAsleep = false;
-      selectingMode = false; inSceneSelect = false; inDistSelect = false;
-      userIsoLocked = false;
+      selectingMode = false;
       screenOn();
       if (mode == MODE_A) solveAutoFull();
       else if (mode == MODE_P || mode == MODE_AV || mode == MODE_TV) solveAuto();
       needRedraw = true;
-    } else if (inSceneSelect) {
-      inSceneSelect = false;                // 二级 -> 回一级模式页
-      enterModeSelect();
-    } else if (inDistSelect) {
-      inDistSelect = false;
-      inSceneSelect = true;
-      needListRender = true;
-    } else if (mode == MODE_A && kScenes[sceneIdx].flashHint
-               && field == F_FILTER) {
-      // Night 场景: 仅当高亮在 FLASH 行时, 长按 -> 对焦距离调节
-      enterDistSelect();
     } else {
-      enterModeSelect();                    // 其余情况: 长按 -> 模式页
+      enterModeSelect();                    // 开机后长按 -> 模式页
     }
   }
 }
 
 // ---------- encoder ----------
-// 旋转方向: 顺时针 (CW) = 下一项 / 数值增大
-// 若实测方向相反, 把 ENC_INVERT 置 1
-#define ENC_INVERT 1
-
 static void pollEncoder() {
   if (!powerOn) return;
   int step = readEncoderStep();
   if (step == 0) return;
-#if ENC_INVERT
-  step = -step;
-#endif
   lastActivity = millis();
   if (screenAsleep) { screenAsleep = false; screenOn(); }
 
   if (selectingMode) {
-    // 顺时针向下: P(0) -> A(1) -> AV(2) -> TV(3) -> M(4) -> OFF(5)
     selIdx = (selIdx + step + MODE_COUNT) % MODE_COUNT;
-    needListRender = true;
+    renderModeSelect();
     return;
   }
 
-  if (inSceneSelect) {
-    sceneCursor = (sceneCursor + step + kNScenes) % kNScenes;
-    needListRender = true;
-    return;
-  }
-
-  if (inDistSelect) {
-    // 转一格 = 0.1m (0.1 ~ 30.0)
-    subjectDist += step * 0.1f;
-    if (subjectDist < 0.1f) subjectDist = 0.1f;
-    if (subjectDist > 30.0f) subjectDist = 30.0f;
-    // 保留一位小数, 避免浮点漂移
-    subjectDist = roundf(subjectDist * 10.0f) / 10.0f;
-    needListRender = true;
-    return;
-  }
-
-  // 主界面: 改当前字段 (仅当该字段可改时才写入)
+  // 主界面: 改当前字段
   int dir = step;
-  if (!fieldEditable(field)) { needRedraw = true; return; }
   if (field == F_SHUTTER)       shutterIdx  = constrain(shutterIdx  + dir, 0, kNShutters - 1);
   else if (field == F_APERTURE) apertureIdx = constrain(apertureIdx + dir, 0, kNApertures - 1);
   else if (field == F_ISO)      isoIdx      = constrain(isoIdx      + dir, 0, kNIsos - 1);
-  else {
-    filterIdx = constrain(filterIdx + dir, 0, kNFilters - 1);
-  }
+  else                          filterIdx   = constrain(filterIdx   + dir, 0, kNFilters - 1);
 
-  if (mode == MODE_A) {
-    // A 档: 旋钮调当前字段
-    if (field == F_ISO) {
-      // 用户手动改 ISO -> 标记为固定, 求解时不被覆盖
-      userIsoLocked = true;
-      solveAutoFull();
-    } else {
-      solveAutoFull();
-    }
-  } else if (mode == MODE_P) {
+  if (mode == MODE_P) {
     if (field != F_FILTER) userSet[field] = true;
     solveAuto();
-  } else if (mode == MODE_AV || mode == MODE_TV) {
+  } else if (mode == MODE_AV) {
+    solveAuto();
+  } else if (mode == MODE_TV) {
     solveAuto();
   } else if (mode == MODE_M) {
     noSolution = false;
@@ -1178,29 +704,11 @@ void setup() {
 void loop() {
   pollButton();
   pollEncoder();
-  if (powerOn && !selectingMode && !inSceneSelect && !inDistSelect) pollBH1750();
-
-  // 互易补偿/闪光 GN: 慢门场景按住 PUSH 旋转 = R 挡; Night 场景按住 PUSH 旋转 = GN
-  if (powerOn && !selectingMode && !inSceneSelect && !inDistSelect
-      && mode == MODE_A && swDown) {
-    const Scene &sc = kScenes[sceneIdx];
-    int step = readEncoderStep();
-    if (step != 0) {
-      if (sc.reciprocity) {
-        recipIdx = (recipIdx + step + kNFRecip) % kNFRecip;
-      } else if (sc.flashHint) {
-        gnIdx = constrain(gnIdx + step, 0, kNGn - 1);
-      }
-      lastActivity = millis();
-      solveAutoFull();
-      needRedraw = true;
-    }
-  }
+  if (powerOn && !selectingMode) pollBH1750();
 
   // 电池图标定时刷新 (正式版: 1s tick)
   static unsigned long lastBattTick = 0;
-  if (powerOn && !screenAsleep && !selectingMode && !inSceneSelect && !inDistSelect
-      && millis() - lastBattTick >= 1000) {
+  if (powerOn && !screenAsleep && !selectingMode && millis() - lastBattTick >= 1000) {
     lastBattTick = millis();
     int oldLv = battLevel;
     updateBattery();
@@ -1209,22 +717,13 @@ void loop() {
   }
 
   // 30 秒息屏
-  if (powerOn && !screenAsleep && !selectingMode && !inSceneSelect && !inDistSelect
-      && millis() - lastActivity > 30000) {
+  if (powerOn && !screenAsleep && !selectingMode && millis() - lastActivity > 30000) {
     screenAsleep = true;
     screenOff();
   }
 
-  // 列表页 (模式页/场景页/距离页) 延迟重绘: 一次画完, 不阻塞输入
-  if (powerOn && !screenAsleep && (selectingMode || inSceneSelect || inDistSelect)
-      && needListRender && millis() - lastListMs >= 30) {
-    needListRender = false;
-    lastListMs = millis();
-    renderListPage();
-  }
-
   // 分页刷新 (主界面)
-  if (!selectingMode && !inSceneSelect && !inDistSelect) {
+  if (!selectingMode) {
     if (drawing && !screenAsleep && powerOn) {
       // 正在发页: 连续把 8 页发完, 中途不接受新重绘
       sendPage(drawPage);
